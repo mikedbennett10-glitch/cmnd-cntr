@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useGoogleLogin } from "@react-oauth/google";
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 const STYLES = `
@@ -527,11 +528,16 @@ export default function App() {
   const captureRef = useRef(null);
 
   // Calendars
-  const [calendars, setCalendars] = useState(() => load("cc_calendars", DEFAULT_CALENDARS));
-  const [newCalName, setNewCalName] = useState("");
+  const [googleToken, setGoogleToken] = useState(null);
+  const [calendars, setCalendars] = useState([]);
   const [calEvents, setCalEvents]   = useState({});   // calId -> events[]
   const [calStatus, setCalStatus]   = useState("idle");
-  const [showCalAdd, setShowCalAdd] = useState(false);
+
+  const googleLogin = useGoogleLogin({
+    onSuccess: (tokenResponse) => setGoogleToken(tokenResponse.access_token),
+    onError:   () => setCalStatus("error"),
+    scope: "https://www.googleapis.com/auth/calendar.readonly",
+  });
 
   // Modals
   const [showStartup, setShowStartup] = useState(false);
@@ -548,70 +554,76 @@ export default function App() {
   useEffect(() => save("cc_tasks",     tasks),     [tasks]);
   useEffect(() => save("cc_parking",   parking),   [parking]);
   useEffect(() => save("cc_intention", intention), [intention]);
-  useEffect(() => save("cc_calendars", calendars), [calendars]);
+  // ── Google Calendar API helpers ─────────────────────────────────────────────
+  const gcalFetch = useCallback(async (url) => {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${googleToken}` } });
+    if (res.status === 401) { setGoogleToken(null); setCalStatus("idle"); throw new Error("token_expired"); }
+    return res.json();
+  }, [googleToken]);
 
-  // ── Calendar fetch (today) ──────────────────────────────────────────────────
+  const normalizeEvent = (ev, calName, calColor) => ({
+    title:   ev.summary || "(No title)",
+    start:   ev.start.dateTime || ev.start.date,
+    end:     ev.end.dateTime   || ev.end.date,
+    allDay:  !ev.start.dateTime,
+    calName,
+    calColor,
+  });
+
+  // ── Fetch calendar list then today's events ─────────────────────────────────
   const fetchCalendar = useCallback(async () => {
-    const activeCals = calendars.filter(c => c.active);
-    if (!activeCals.length) return;
+    if (!googleToken) return;
     setCalStatus("loading");
-    const today = new Date();
-    const results = {};
     try {
-      for (const cal of activeCals) {
-        const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 1000,
-            system: `You fetch Google Calendar events and return ONLY a JSON array — no preamble, no markdown fences. Each object: { "title": string, "start": ISO8601, "end": ISO8601, "allDay": boolean }. Return [] if no events. Today: ${today.toISOString()}.`,
-            messages: [{ role: "user", content: `List all events for calendar "${cal.name}" on ${today.toDateString()}.` }],
-            mcp_servers: [{ type: "url", url: "https://calendarmcp.googleapis.com/mcp/v1", name: "google-calendar" }],
-          }),
-        });
-        const data = await response.json();
-        const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "[]";
-        const clean = text.replace(/```json|```/g, "").trim();
-        results[cal.id] = JSON.parse(clean);
+      const listData = await gcalFetch("https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader");
+      const cals = (listData.items || []).map((c, i) => ({
+        id:     c.id,
+        name:   c.summary,
+        color:  c.backgroundColor || CAL_COLORS[i % CAL_COLORS.length],
+        active: c.selected !== false,
+      }));
+      setCalendars(cals);
+
+      const today = new Date();
+      const tMin  = new Date(today); tMin.setHours(0,0,0,0);
+      const tMax  = new Date(today); tMax.setHours(23,59,59,999);
+      const params = new URLSearchParams({ timeMin: tMin.toISOString(), timeMax: tMax.toISOString(), singleEvents: "true", orderBy: "startTime", maxResults: "50" });
+
+      const results = {};
+      for (const cal of cals.filter(c => c.active)) {
+        const data = await gcalFetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?${params}`);
+        results[cal.id] = (data.items || []).map(ev => normalizeEvent(ev, cal.name, cal.color));
       }
       setCalEvents(results);
       setCalStatus("loaded");
     } catch (e) {
-      console.error(e);
-      setCalStatus("error");
+      if (e.message !== "token_expired") { console.error(e); setCalStatus("error"); }
     }
-  }, [calendars]);
+  }, [googleToken, gcalFetch]);
 
-  useEffect(() => { fetchCalendar(); }, []);
+  useEffect(() => { if (googleToken) fetchCalendar(); }, [googleToken]);
 
   // ── Week-ahead fetch ────────────────────────────────────────────────────────
   const fetchWeek = useCallback(async () => {
+    if (!googleToken) return;
     setWeekStatus("loading");
-    const activeCals = calendars.filter(c => c.active);
-    const days = Array.from({ length: 7 }, (_, i) => getDayRange(i));
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 2000,
-          system: `You fetch Google Calendar events for the next 7 days and return ONLY a JSON array — no markdown. Each object: { "title": string, "start": ISO8601, "end": ISO8601, "allDay": boolean, "calendarName": string }. Today: ${new Date().toISOString()}. Include all connected calendars.`,
-          messages: [{ role: "user", content: `List all events from today (${days[0].date.toDateString()}) through ${days[6].date.toDateString()} across all calendars: ${activeCals.map(c=>c.name).join(", ")}.` }],
-          mcp_servers: [{ type: "url", url: "https://calendarmcp.googleapis.com/mcp/v1", name: "google-calendar" }],
-        }),
-      });
-      const data = await response.json();
-      const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "[]";
-      const clean = text.replace(/```json|```/g, "").trim();
-      setWeekEvents(JSON.parse(clean));
+      const days  = Array.from({ length: 7 }, (_, i) => getDayRange(i));
+      const tMin  = days[0].start;
+      const tMax  = days[6].end;
+      const params = new URLSearchParams({ timeMin: tMin.toISOString(), timeMax: tMax.toISOString(), singleEvents: "true", orderBy: "startTime", maxResults: "200" });
+
+      const allEvents = [];
+      for (const cal of calendars.filter(c => c.active)) {
+        const data = await gcalFetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?${params}`);
+        (data.items || []).forEach(ev => allEvents.push(normalizeEvent(ev, cal.name, cal.color)));
+      }
+      setWeekEvents(allEvents);
       setWeekStatus("loaded");
     } catch (e) {
-      console.error(e);
-      setWeekStatus("error");
+      if (e.message !== "token_expired") { console.error(e); setWeekStatus("error"); }
     }
-  }, [calendars]);
+  }, [googleToken, calendars, gcalFetch]);
 
   const openWeek = () => { setShowWeek(true); if (!weekEvents) fetchWeek(); };
 
@@ -652,15 +664,7 @@ export default function App() {
   const toggleThree = (i)  => setThree(prev => prev.map((t, idx) => idx === i ? { ...t, done: !t.done } : t));
   const setThreeText = (i, val) => setThree(prev => prev.map((t, idx) => idx === i ? { ...t, text: val } : t));
 
-  const addCalendar = () => {
-    if (!newCalName.trim()) return;
-    const id = `cal_${Date.now()}`;
-    const color = CAL_COLORS[calendars.length % CAL_COLORS.length];
-    setCalendars(prev => [...prev, { id, name: newCalName.trim(), color, active: true }]);
-    setNewCalName(""); setShowCalAdd(false);
-  };
   const toggleCal = (id) => setCalendars(prev => prev.map(c => c.id === id ? { ...c, active: !c.active } : c));
-  const removeCal = (id) => { setCalendars(prev => prev.filter(c => c.id !== id)); setCalEvents(prev => { const n={...prev}; delete n[id]; return n; }); };
 
   const toggleStartup = (i) => setStartupChecks(prev => prev.map((v,idx) => idx===i ? !v : v));
   const resetStartup  = () => setStartupChecks([false,false,false,false,false,false]);
@@ -812,54 +816,37 @@ export default function App() {
             <div className="card-title"><span className="dot dot-red" /> Today's Rhythm</div>
 
             {/* Calendar tabs */}
-            <div className="cal-tabs">
-              {calendars.map(cal => (
-                <button
-                  key={cal.id}
-                  className={`cal-tab${cal.active ? " active" : ""}`}
-                  onClick={() => toggleCal(cal.id)}
-                >
-                  <span className="cal-dot" style={{ background: cal.color }} />
-                  {cal.name}
-                  {calendars.length > 1 && (
-                    <span
-                      style={{ marginLeft: 3, fontSize: "0.6rem", opacity: 0.5, cursor: "pointer" }}
-                      onClick={e => { e.stopPropagation(); removeCal(cal.id); }}
-                    >✕</span>
-                  )}
-                </button>
-              ))}
-              <button className="cal-tab" onClick={() => setShowCalAdd(v => !v)} title="Add calendar">
-                + Add
-              </button>
-            </div>
-
-            {showCalAdd && (
-              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-                <input
-                  className="cal-add-input"
-                  placeholder="Calendar name (e.g. Work, Family)…"
-                  value={newCalName}
-                  onChange={e => setNewCalName(e.target.value)}
-                  onKeyDown={e => e.key === "Enter" && addCalendar()}
-                  autoFocus
-                />
-                <button className="btn btn-teal btn-sm" onClick={addCalendar}>Add</button>
+            {calendars.length > 0 && (
+              <div className="cal-tabs">
+                {calendars.map(cal => (
+                  <button
+                    key={cal.id}
+                    className={`cal-tab${cal.active ? " active" : ""}`}
+                    onClick={() => toggleCal(cal.id)}
+                  >
+                    <span className="cal-dot" style={{ background: cal.color }} />
+                    {cal.name}
+                  </button>
+                ))}
               </div>
             )}
 
-            {calStatus === "loading" && <div className="cal-loading">Consulting the calendars…</div>}
-            {calStatus === "error"   && (
+            {!googleToken && (
+              <button className="btn btn-teal btn-block" onClick={() => googleLogin()}>
+                Connect Google Calendar
+              </button>
+            )}
+            {googleToken && calStatus === "loading" && <div className="cal-loading">Loading your calendars…</div>}
+            {googleToken && calStatus === "error" && (
               <div>
-                <div className="cal-loading" style={{ marginBottom: 8 }}>Could not reach calendar. Check connection.</div>
+                <div className="cal-loading" style={{ marginBottom: 8 }}>Could not load calendar. Check connection.</div>
                 <button className="btn btn-slate btn-block" onClick={fetchCalendar}>Retry</button>
               </div>
             )}
-            {calStatus === "idle"   && <button className="btn btn-teal btn-block" onClick={fetchCalendar}>Load Today's Calendar</button>}
-            {calStatus === "loaded" && allTodayEvents.length === 0 && (
+            {googleToken && calStatus === "loaded" && allTodayEvents.length === 0 && (
               <div className="empty">No events today. Clear runway — guard it.</div>
             )}
-            {calStatus === "loaded" && allTodayEvents.length > 0 && (
+            {googleToken && calStatus === "loaded" && allTodayEvents.length > 0 && (
               <div className="cal-list">
                 {allTodayEvents.map((ev, i) => {
                   const nowEv = isNow(ev.start, ev.end);
@@ -881,11 +868,16 @@ export default function App() {
               </div>
             )}
 
-            <div style={{ marginTop: 10 }}>
-              <button className="btn btn-slate btn-sm" onClick={fetchCalendar}>
-                {calStatus === "loading" ? "Loading…" : "↻ Refresh"}
-              </button>
-            </div>
+            {googleToken && (
+              <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+                <button className="btn btn-slate btn-sm" onClick={fetchCalendar}>
+                  {calStatus === "loading" ? "Loading…" : "↻ Refresh"}
+                </button>
+                <button className="btn btn-slate btn-sm" onClick={() => { setGoogleToken(null); setCalendars([]); setCalEvents({}); setCalStatus("idle"); }}>
+                  Disconnect
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Closed Today */}
